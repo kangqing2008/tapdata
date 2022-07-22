@@ -5,6 +5,6 @@ spring:
 
   data:
     mongodb:
-      uri: 'mongodb://127.0.0.1:27017/tapdata?authSource=admin'
+      uri: 'mongodb://127.0.0.1:27017/tapdata_v2?authSource=admin'
       cursorBatchSize: 1000
 

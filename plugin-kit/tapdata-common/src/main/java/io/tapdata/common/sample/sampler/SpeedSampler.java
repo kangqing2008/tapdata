@@ -16,6 +16,10 @@ public class SpeedSampler implements Sampler {
         totalValue.add(value);
     }
 
+    public void add() {
+        totalValue.add(1);
+    }
+
     @Override
     public Number value() {
         Long temp = lastCalculateTime;
