@@ -15,6 +15,7 @@ import com.tapdata.tm.monitor.constant.TableNameEnum;
 import com.tapdata.tm.monitor.dto.TransmitTotalVo;
 import com.tapdata.tm.monitor.entity.AgentEnvironmentEntity;
 import com.tapdata.tm.monitor.entity.MeasurementEntity;
+import com.tapdata.tm.monitor.param.MeasurementQueryParam;
 import com.tapdata.tm.monitor.vo.GetMeasurementVo;
 import com.tapdata.tm.monitor.vo.GetStaticVo;
 import com.tapdata.tm.task.entity.SubTaskEntity;
@@ -23,10 +24,12 @@ import com.tapdata.tm.utils.BeanUtil;
 import com.tapdata.tm.utils.Lists;
 import com.tapdata.tm.utils.TimeUtil;
 import io.tapdata.common.sample.request.*;
+import io.tapdata.common.sample.sampler.NumberSampler;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.collections.map.HashedMap;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.poi.xdgf.usermodel.section.geometry.RelEllipticalArcTo;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +43,7 @@ import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Service;
 
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -785,5 +789,283 @@ public class MeasurementService {
         return measurementEntity;
     }
 
+    private static final String TAG_FORMAT = String.format("%s.%%s", MeasurementEntity.FIELD_TAGS);
+    private static final String FIELD_FORMAT = String.format("%s.%s.%%s",
+            MeasurementEntity.FIELD_SAMPLES, Sample.FIELD_VALUES);
 
+
+    public Object getSamples(MeasurementQueryParam measurementQueryParam) {
+        List<List<Map<String, Object>>> data = new ArrayList<>();
+        // get the full life cycle data
+        if (measurementQueryParam.fullLifeCycle()) {
+            // TODO(dexter): add full life cycle support, should consider the granularity, we could query the db and find out the interval of full life cycle
+            return null;
+        }
+
+        long start = measurementQueryParam.getStartAt();
+        long end = measurementQueryParam.getEndAt();
+        List<MeasurementQueryParam.MeasurementQuerySample> instantQuerySamples = null;
+        List<MeasurementQueryParam.MeasurementQuerySample> differenceQuerySamples = null;
+        List<MeasurementQueryParam.MeasurementQuerySample> continuousQuerySamples = null;
+        for(MeasurementQueryParam.MeasurementQuerySample querySample : measurementQueryParam.getSamples()) {
+            switch (querySample.getType()) {
+                case MeasurementQueryParam.MeasurementQuerySample.MEASUREMENT_QUERY_SAMPLE_TYPE_INSTANT:
+                    if (instantQuerySamples == null) {
+                        instantQuerySamples = new ArrayList<>();
+                    }
+                    instantQuerySamples.add(querySample);
+                    break;
+                case MeasurementQueryParam.MeasurementQuerySample.MEASUREMENT_QUERY_SAMPLE_TYPE_DIFFERENCE:
+                    if (differenceQuerySamples == null) {
+                        differenceQuerySamples = new ArrayList<>();
+                    }
+                    differenceQuerySamples.add(querySample);
+                    break;
+                case MeasurementQueryParam.MeasurementQuerySample.MEASUREMENT_QUERY_SAMPLE_TYPE_CONTINUOUS:
+                    if (continuousQuerySamples == null) {
+                        continuousQuerySamples = new ArrayList<>();
+                    }
+                    continuousQuerySamples.add(querySample);
+                    break;
+            }
+        }
+
+        if (null != instantQuerySamples) {
+            Map<String, Sample> instantSamples = getInstantSamples(instantQuerySamples, end);
+            System.out.println();
+        }
+
+        if (null != differenceQuerySamples) {
+        }
+
+        if (null != continuousQuerySamples) {
+            Map<String, List<Sample>> continuousSamples = getContinuousSamples(continuousQuerySamples, start, end);
+            long interval = calculateInterval(start, end);
+            List<Long> timeline = getTimeline(start, end, interval);
+            List<Map<String, Object>> formatContinuousSamples = formatContinuousSamples(continuousSamples, timeline, interval);
+            data.add(formatContinuousSamples);
+        }
+
+
+
+
+
+        return data;
+    }
+
+
+    private Map<String, Sample> getInstantSamples(List<MeasurementQueryParam.MeasurementQuerySample> querySamples, long time) {
+        Map<String, Sample> data = new HashMap<>();
+
+        List<String> includedFields = new ArrayList<>();
+        includedFields.add(MeasurementEntity.FIELD_TAGS);
+        includedFields.add(String.format("%s.%s", MeasurementEntity.FIELD_SAMPLES, Sample.FIELD_DATE));
+        for(MeasurementQueryParam.MeasurementQuerySample querySample : querySamples) {
+            if (!StringUtils.equalsAny(querySample.getType(),
+                    MeasurementQueryParam.MeasurementQuerySample.MEASUREMENT_QUERY_SAMPLE_TYPE_INSTANT,
+                    MeasurementQueryParam.MeasurementQuerySample.MEASUREMENT_QUERY_SAMPLE_TYPE_DIFFERENCE)) {
+                continue;
+            }
+            Criteria criteria = Criteria.where(MeasurementEntity.FIELD_DATE).gte(new Date(time));
+            for (Map.Entry<String, String> entry : querySample.getTags().entrySet()) {
+                criteria.and(String.format(TAG_FORMAT, entry.getKey())).is(entry.getValue());
+            }
+
+            for (String field : querySample.getFields()) {
+                includedFields.add(String.format(FIELD_FORMAT, field));
+            }
+            Query query = new Query(criteria);
+            query.fields().include(includedFields.toArray(new String[]{}));
+            query.with(Sort.by(MeasurementEntity.FIELD_DATE).ascending());
+            MeasurementEntity entity = mongoOperations.findOne(query, MeasurementEntity.class, TableNameEnum.AgentMeasurement.getValue());
+            if (entity != null) {
+                String hash = hashTag(entity.getTags());
+                for(Sample sample : entity.getSamples()) {
+                    if (!data.containsKey(hash)) {
+                        data.put(hash, sample);
+                        continue;
+                    }
+                    long oldInterval = Math.abs(data.get(hash).getDate().getTime() - time);
+                    long newInterval = Math.abs(sample.getDate().getTime() - time);
+                    if (newInterval < oldInterval) {
+                        data.put(hash, sample);
+                    }
+                }
+            }
+        }
+
+        return data;
+    }
+
+    private String hashTag(Map<String, String> tags) {
+        StringBuilder sb = new StringBuilder();
+        for(String key: tags.keySet().stream().sorted().collect(Collectors.toList())) {
+            sb.append(String.format("%s:%s", key, tags.get(key)));
+            sb.append(";");
+        }
+
+        return sb.toString();
+    }
+
+    private Map<String, String> reverseHashTag(String hash) {
+        Map<String, String> tags = new HashMap<>();
+        for(String pair : hash.split(";")) {
+            String[] kv = pair.split(":");
+            tags.put(kv[0], kv[1]);
+        }
+
+        return tags;
+    }
+
+    public Map<String, Number> getDifferenceSamples(List<MeasurementQueryParam.MeasurementQuerySample> samples, long start, long end) {
+        Map<String, Sample> startInstant = getInstantSamples(samples, start);
+        Map<String, Sample> endInstant = getInstantSamples(samples, end);
+
+
+
+
+
+
+        return null;
+    }
+
+    private Map<String, List<Sample>> getContinuousSamples(List<MeasurementQueryParam.MeasurementQuerySample> querySamples, long start, long end) {
+        Map<String, List<Sample>> data = new HashMap<>();
+
+        Criteria criteria = Criteria.where(String.format("%s.%s", MeasurementEntity.FIELD_SAMPLES, Sample.FIELD_DATE))
+                .gte(new Date(start))
+                .lte(new Date(end));
+        criteria.and(MeasurementEntity.FIELD_GRANULARITY).is(calculateGranularity(start, end));
+
+        List<String> includedFields = new ArrayList<>();
+        includedFields.add(MeasurementEntity.FIELD_TAGS);
+        includedFields.add(String.format("%s.%s", MeasurementEntity.FIELD_SAMPLES, Sample.FIELD_DATE));
+
+        Criteria tagCriteria = new Criteria();
+        for(MeasurementQueryParam.MeasurementQuerySample querySample : querySamples) {
+            if (!StringUtils.equalsAny(querySample.getType(),
+                    MeasurementQueryParam.MeasurementQuerySample.MEASUREMENT_QUERY_SAMPLE_TYPE_CONTINUOUS)) {
+                continue;
+            }
+            Criteria orCriteria = new Criteria();
+            for (Map.Entry<String, String> entry : querySample.getTags().entrySet()) {
+                orCriteria.and(String.format(TAG_FORMAT, entry.getKey())).is(entry.getValue());
+            }
+            tagCriteria.orOperator(orCriteria);
+
+            for (String field : querySample.getFields()) {
+                includedFields.add(String.format(FIELD_FORMAT, field));
+            }
+        }
+        criteria.andOperator(tagCriteria);
+
+        Query query = new Query(criteria);
+        query.fields().include(includedFields.toArray(new String[]{}));
+        query.with(Sort.by(MeasurementEntity.FIELD_DATE).ascending());
+        List<MeasurementEntity> entities = mongoOperations.find(query, MeasurementEntity.class, TableNameEnum.AgentMeasurement.getValue());
+        for (MeasurementEntity entity : entities) {
+            String hash = hashTag(entity.getTags());
+            if (!data.containsKey(hash)) {
+                data.put(hash, new ArrayList<>());
+            }
+            data.get(hash).addAll(entity.getSamples());
+        }
+
+        return data;
+    }
+
+    private  List<Map<String, Object>> formatContinuousSamples(Map<String, List<Sample>> continuousSamples, List<Long> timeline, long interval) {
+        List<Map<String, Object>> data = new ArrayList<>();
+        for (Map.Entry<String, List<Sample>> entry : continuousSamples.entrySet()) {
+            Map<String, String> tags = reverseHashTag(entry.getKey());
+            Map<String, Number[]> values = new HashMap<>();
+
+            List<Sample> samples = entry.getValue().stream().sorted(Comparator.comparing(Sample::getDate)).collect(Collectors.toList());
+
+            int timeLineIdx = 0;
+            int sampleIdx1 = 0;
+            int sampleIdx2 = 0;
+            while (timeLineIdx < timeline.size() && sampleIdx1 < samples.size()) {
+                Sample sample1 = samples.get(sampleIdx1);
+                long time1 = sample1.getDate().getTime();
+                long gap1 = Math.abs(timeline.get(timeLineIdx) - time1);
+
+                if (gap1 > interval / 2) {
+                    timeLineIdx += 1;
+                    continue;
+                }
+
+                // set the value into array
+                for(String key : sample1.getVs().keySet()) {
+                    values.putIfAbsent(key, new Number[timeline.size()]);
+                    values.get(key)[timeLineIdx] = sample1.getVs().get(key);
+                }
+
+                boolean skipSet = false;
+                while(sampleIdx2 < samples.size() - 1) {
+                    sampleIdx2 += 1;
+                    Sample sample2 = samples.get(sampleIdx2);
+                    long time2 = sample2.getDate().getTime();
+                    long gap2 = Math.abs(timeline.get(timeLineIdx) - time2);
+                    if (gap2 > interval / 2) {
+                        break;
+                    }
+
+                    if (!skipSet && gap1 > gap2) {
+                        // set the value into array, only if the gap is smaller than the former one
+                        for(String key : sample2.getVs().keySet()) {
+                            values.putIfAbsent(key, new Number[timeline.size()]);
+                            values.get(key)[timeLineIdx] = sample2.getVs().get(key);
+                        }
+                    }
+                    // the data gap after must be greater, does not have to set again, skip the set step
+                    skipSet = true;
+                }
+                timeLineIdx += 1;
+                sampleIdx1 = sampleIdx2;
+            }
+            Map<String, Object> single = new HashMap<>(values);
+            single.put("tags", tags);
+            data.add(single);
+        }
+
+        return data;
+    }
+
+    private static final long MINUTES_TOTAL_FOR_5SECONDS_GRANULARITY = 60L;
+    private static final long MINUTES_TOTAL_FOR_MINUTE_GRANULARITY = 1440L;
+    private static final long MINUTES_TOTAL_FOR_HOUR_GRANULARITY = 43200L;
+    private String calculateGranularity(long startAt, long endAt) {
+        long minutes = (endAt - startAt) / 60000;
+        if (minutes < MINUTES_TOTAL_FOR_5SECONDS_GRANULARITY)
+            return "minute";
+        if (minutes < MINUTES_TOTAL_FOR_MINUTE_GRANULARITY)
+            return "hour";
+        if (minutes < MINUTES_TOTAL_FOR_HOUR_GRANULARITY)
+            return "day";
+        return "month";
+    }
+
+    private long calculateInterval(long startAt, long endAt) {
+        long minutes = (endAt - startAt) / 60000;
+        if (minutes < MINUTES_TOTAL_FOR_5SECONDS_GRANULARITY)
+            return 5 * 1000;
+        if (minutes < MINUTES_TOTAL_FOR_MINUTE_GRANULARITY)
+            return 60 * 1000;
+        if (minutes < MINUTES_TOTAL_FOR_HOUR_GRANULARITY)
+            return 60 * 60 * 1000;
+
+        return 24 * 60 * 60 * 1000;
+    }
+
+    private List<Long> getTimeline(long start, long end, long interval) {
+        // get the time trail with same interval
+        List<Long> timeline = new ArrayList<>();
+        while (start < end) {
+            timeline.add(end);
+            end -= interval;
+        }
+
+        return timeline.stream().sorted().collect(Collectors.toList());
+    }
 }
